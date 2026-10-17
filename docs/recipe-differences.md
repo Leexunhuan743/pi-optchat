@@ -23,13 +23,13 @@ The README has the summary table. This page has the detail: what changed in each
 
 - 512-byte summary nodes. By default summaries up to 640 bytes are accepted without a retry, as long as they are smaller than what they replace (setting: Summary size tolerance).
 - A memory view that grows a line per message and, past 128,000 bytes, merges in one batch down to 64,000. Between batches it only grows at its end, so each turn reads the last one's view from the cache. The view is saved and reloaded as it was.
-- Binary merges, 8 compression workers, fixed retry delays, 5 shortening attempts, and a 30,000-character tool output cap.
+- Binary merges, 8 compression workers by default (setting: Summaries at once), fixed retry delays, 5 shortening attempts, and a 30,000-character tool output cap.
 
 ## Compaction view and scheduling
 
 Compactions get their own view, as in the 2026-10-08 revision: the memory view merged further, to between 16,000 and 32,000 bytes with the same sawtooth, ending at the line being built.
 
-A message's summary starts once fewer than 8 lines before it are unsummarized, so up to 8 compactions run at once on one cached view. An import logs its messages the same way, waiting only while 8 messages and due merges are unbuilt, so the merges keep up.
+A message's summary starts once fewer than N lines before it are unsummarized, so up to N compactions run at once on one cached view (N is the **Summaries at once** setting, 8 by default). An import logs its messages the same way, waiting only while that many messages and due merges are unbuilt, so the merges keep up.
 
 Where the recipe ends a compaction's view at the first line not summarized yet, OptChat shows that line as a placeholder and keeps the lines after it. Cutting there also hid the short lines that follow, such as an echo's own tool call, and an A/B on real turns scored those summaries lower (#101).
 
