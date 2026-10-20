@@ -350,6 +350,7 @@ test('the view merges in one batch from its budget down to half, and between bat
 test('the view is saved and loaded as it was, and rebuilt only when the saved one no longer tiles the log', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-saved-view-'));
   const compress = async () => 's'.repeat(300), parts = (memory: Memory) => memory.view.map(p => [p.l, p.i]);
+  const chatView = () => { const { compaction: _, ...chat } = JSON.parse(readFileSync(join(dir, 'view.json'), 'utf8')); return chat; };
   let memory = new Memory(dir, compress, () => {}, 3000);
   try {
     for (let i = 0; i < 16; i++) { memory.append('user', `${i} ${'.'.repeat(600)}`); await memory.settle(AbortSignal.timeout(5000), 'tree'); }
@@ -365,7 +366,7 @@ test('the view is saved and loaded as it was, and rebuilt only when the saved on
     assert.deepEqual(parts(memory), saved);
     memory.append('user', 'one more');
     assert.deepEqual(parts(memory), [...saved, [0, 16]]);
-    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'view.json'), 'utf8')), { parts: saved, merging: false }, 'a line added without a merge is not saved');
+    assert.deepEqual(chatView(), { parts: saved, merging: false }, 'a line added without a merge is not saved');
     await memory.close();
     const warnings: string[] = [];
     for (const invalid of [[[0, 0], [0, 2]], { version: 99 }, { parts: saved, merging: 'unknown' }]) {
@@ -374,10 +375,32 @@ test('the view is saved and loaded as it was, and rebuilt only when the saved on
       memory = new Memory(dir, compress, text => warnings.push(text), 3000);
       assert.match(warnings.join('\n'), /Rebuilt the memory view/);
       assert.equal(start(memory.view[0]), 0); assert.equal(end(memory.view.at(-1)!), 17);
-      assert.deepEqual(JSON.parse(readFileSync(join(dir, 'view.json'), 'utf8')), { parts: parts(memory), merging: false });
+      assert.deepEqual(chatView(), { parts: parts(memory), merging: false });
       await memory.close();
     }
   } finally { await memory.close(); removeDir(dir); }
+});
+
+test('a reopened memory gives compactions the same views as one that never closed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'optchat-compaction-view-'));
+  // Reopened before the chat's view merges, where replaying the log with every line built folds differently than it grew,
+  // and after, where the compactions' view used to be refolded from the chat's.
+  const run = async (name: string, reopenAt: number[] = []) => {
+    const contexts: string[] = [];
+    const compress = async ({ context }: Compression) => { contexts.push(context); return 's'.repeat(300); };
+    let memory = new Memory(join(dir, name), compress, () => {}, 16000);
+    for (let i = 0; i < 70; i++) {
+      if (reopenAt.includes(i)) {
+        assert.equal(memory.view.some(p => p.l > 0), i > 50, 'the chat\'s view has merged by the second reopen, not the first');
+        await memory.close(); memory = new Memory(join(dir, name), compress, () => {}, 16000);
+      }
+      memory.append('user', `${i} ${'.'.repeat(600)}`); await memory.settle(AbortSignal.timeout(5000), 'tree');
+    }
+    await memory.close();
+    return contexts;
+  };
+  try { assert.deepEqual(await run('reopened', [30, 62]), await run('live')); }
+  finally { removeDir(dir); }
 });
 
 test('a process killed mid-batch resumes the chat view to the same lines as an uninterrupted run', { timeout: 10000 }, async () => {
