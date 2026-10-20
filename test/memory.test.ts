@@ -289,7 +289,7 @@ test('a subagent\'s task goes in its own block after the view, so siblings with 
 
 test('a request with no status line marks its last block, not the top level, so a 1h block TTL set by a proxy does not clash', () => {
   const view = '<chat>\n' + '0+1|summary of a decision\n'.repeat(200) + '</chat>';
-  // As a compactor call ends: the view, then the instruction, then Pi's empty settings message.
+  // The view, an instruction, a reply and a follow-up, then Pi's empty settings message.
   const payload = { messages: [
     { role: 'user', content: [{ type: 'text', text: view }, { type: 'text', text: 'compress this' }] },
     { role: 'assistant', content: [{ type: 'thinking', thinking: 'hm' }, { type: 'text', text: 'line' }] },
