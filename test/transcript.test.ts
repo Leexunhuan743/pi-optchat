@@ -300,7 +300,7 @@ test('another extension\'s shown custom message starts a turn and stays in memor
   }
 });
 
-test('main agent keeps Pi\'s AGENTS.md files and skills, with profile instructions last', async () => {
+test('main agent keeps Pi\'s AGENTS.md files and skills, with profile instructions last, and picks up AGENTS.md edits on the next run', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'optchat-prompt-'));
   const agentDir = join(dir, 'agent');
   const oldHome = process.env.OPTCHAT_HOME;
@@ -345,6 +345,9 @@ test('main agent keeps Pi\'s AGENTS.md files and skills, with profile instructio
     assert.ok(system.includes('demo-skill'), 'skills are listed');
     const order = ['GLOBAL_RULES', 'REPO_RULES', 'PROFILE_RULES'].map(rule => system.indexOf(rule));
     assert.ok(order.every((at, i) => at >= 0 && (i === 0 || at > order[i - 1])), 'global, then repo AGENTS.md, then profile instructions last');
+    writeFileSync(join(dir, 'AGENTS.md'), 'REPO_RULES_V2');
+    await session.prompt('Again.');
+    assert.ok(systems.at(-1)?.includes('REPO_RULES_V2'), 'an AGENTS.md edit reaches the next run without /reload');
   } finally {
     if (session) { await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' }); session.dispose(); }
     if (oldHome === undefined) delete process.env.OPTCHAT_HOME; else process.env.OPTCHAT_HOME = oldHome;
