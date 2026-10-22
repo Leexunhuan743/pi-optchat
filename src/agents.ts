@@ -112,6 +112,11 @@ const answering = (session: AgentSession) => new Promise<void>(resolve => {
     if (event.type === 'message_update' || event.type === 'agent_end' || event.type === 'message_end' && event.message.role === 'assistant') { off(); resolve(); }
   });
 });
+
+/** What a run interrupted with messages queued continues with: the user's interrupt, so windows show it as theirs. */
+export const INTERRUPTED = 'Interrupted by the user:\n\n';
+const interruptedWith = (texts: string[]) => `${INTERRUPTED}${texts.join('\n\n')}`;
+
 export class Children {
   private readonly running = new Map<string, LiveRun>();
   readonly history: RunHistory;
@@ -385,7 +390,9 @@ export class Children {
       await session.prompt(prompt);
       while (info.state !== 'stopping') {
         if (live.interruption) {
-          const guidance = live.interruption.filter(g => g.state === 'queued');
+          // A message Pi took during the abort (a rebuild of its queue can still be landing) went into a request the abort
+          // cancelled, so it got no reply: it goes in this prompt too. Only a stop's undelivered ones stay out.
+          const guidance = live.interruption.filter(g => g.state !== 'undelivered');
           // Read Pi's queue only once a rebuild has landed, and take the interrupt's messages off it so they arrive once.
           // Until this is done, tell() holds new messages in pendingGuidance, where the turn below or a pause picks them up.
           await live.requeueing;
@@ -407,7 +414,7 @@ export class Children {
           if (!transition(info, 'running')) continue; // A stop during the cleanup wins.
           for (const g of guidance) g.state = 'delivered';
           this.save(info);
-          await session.prompt(`Interrupted by the user:\n\n${guidance.map(g => g.text).join('\n\n')}`);
+          await session.prompt(interruptedWith(guidance.map(g => g.text)));
           continue;
         }
         const paused = info.state === 'paused';
@@ -526,9 +533,12 @@ export class Children {
     if (!live || !['running', 'waiting'].includes(live.info.state)) throw new Error(`No running subagent ${id}.`);
     const guidance = live.info.guidance.filter(g => g.state === 'queued');
     // Nothing yields before the abort starts, so the run cannot finish in between and drop the messages.
-    // They leave pendingGuidance here and Pi's steering queue in execute(), which then sends them in one prompt.
+    // They leave pendingGuidance and Pi's steering queue here, and execute() sends them in one prompt. Pi's queue must be empty
+    // before the abort: after an aborted tool call Pi hands it to a request the abort cancels.
     const texts = new Set(guidance.map(g => g.text));
     live.pendingGuidance = live.pendingGuidance.filter(text => !texts.has(text));
+    // The rest of the queue (a child's tell_parent message) follows the interrupt's prompt, as reports to a paused run do.
+    live.pendingReports.push(...live.session.clearQueue().steering.filter(text => !texts.has(text)));
     live.interruption = guidance;
     live.wake?.();
     await live.session.abort();
