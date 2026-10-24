@@ -35,7 +35,7 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
   const memory = new Memory(dir, async input => input.source.slice(0, 100), () => {});
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null,
     modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
-  const control = { failSummary: false, truncateSummary: false, summaryText: 'Handoff: retained the user correction and actual work.' };
+  const control = { failSummary: false, truncateSummary: false, holdSummary: false, summaryText: 'Handoff: retained the user correction and actual work.' };
   const requests: string[] = [], summaries: string[] = [], reports: string[] = [], warnings: string[] = [];
   const summaryOptions: { maxTokens?: number; systemPrompt?: string }[] = [];
   runtime.registerProvider('window-test', {
@@ -75,7 +75,7 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
       }
       void (async () => {
         stream.push({ type: 'start', partial: message });
-        const hold = !summary && (text.includes('hold work') || last?.role === 'toolResult' && text.includes('DESCENDANT_TESTS_PASSED_123'));
+        const hold = summary ? control.holdSummary : text.includes('hold work') || last?.role === 'toolResult' && text.includes('DESCENDANT_TESTS_PASSED_123');
         // A held reply is mid-stream, as a real one would be while the model is still writing.
         if (hold) stream.push({ type: 'text_delta', contentIndex: 0, delta: 'Reply', partial: message });
         // Outlasts a few window status ticks, so its parent is seen waiting on it.
@@ -366,6 +366,39 @@ test('pending handoffs survive failed delivery and restart without another model
     assert.equal(f.summaries.length, calls);
     await failing.close(); await restored.close();
   } finally { await f.close(); }
+});
+
+test('closing the owner leaves a connected handoff for the next start instead of waiting on its summary', async () => {
+  const f = await fixture();
+  const events: WindowEvent[] = [];
+  const close = await serveWindows(f.dir, f.children, () => true, async text => { f.reports.push(text); });
+  const client = await connectWindow(f.dir, event => events.push(event), () => {});
+  const restart = (reports: string[] = []) => new Children(f.memory, f.registry, f.choice, () => '', async text => { reports.push(text); }, () => {}, f.dir, f.options);
+  try {
+    await client.request('start', 'Investigate this repository.', f.dir);
+    const id = events.find(e => e.name === 'started')?.text; assert.ok(id);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    // What /reload does: the window ends as owner-stopped, without a summary.
+    f.children.deferHandoffs(); await close();
+    assert.equal(f.summaries.length, 0);
+    assert.deepEqual(f.children.history.records.get(id)?.handoff, { reason: 'owner-stopped' });
+
+    // The next start's recovery is aborted by another quick /reload, still leaving the handoff undelivered.
+    f.control.holdSummary = true;
+    const interrupted = restart();
+    const recovery = interrupted.recoverHandoffs();
+    await until(() => f.summaries.length === 1);
+    interrupted.deferHandoffs(); await recovery; await interrupted.close();
+    assert.deepEqual(interrupted.history.records.get(id)?.handoff, { reason: 'owner-stopped' }, 'no fallback written, nothing delivered');
+
+    f.control.holdSummary = false;
+    const delivered: string[] = [];
+    const restored = restart(delivered);
+    await restored.recoverHandoffs(); await restored.recoverHandoffs();
+    assert.equal(delivered.length, 1);
+    assert.match(delivered[0], /interrupted \(owner-stopped\)\.[^]*Handoff: retained the user correction/);
+    await restored.close();
+  } finally { client.close(); await f.close(); }
 });
 
 test('disconnect during startup cancels cleanly, and importing owners reject new work', async () => {
