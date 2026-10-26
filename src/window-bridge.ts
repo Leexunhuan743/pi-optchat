@@ -6,6 +6,7 @@ import { record } from './cache.ts';
 import { checkSocketPath, isWindows, profileSocket, removeStaleSocket } from './profiles.ts';
 import { textContent } from './transcript.ts';
 import { isActiveRun, type RunInfo } from './runs.ts';
+import { HANDOFF_REQUEST } from './prompts.ts';
 
 const ACTIONS = ['list-agents', 'attach', 'start', 'say', 'tell-main', 'answer', 'interrupt', 'withdraw', 'complete'] as const;
 type Action = typeof ACTIONS[number];
@@ -175,7 +176,9 @@ export async function serveWindows(directory: string, children: Children, availa
     });
     /** Main-agent guidance and child reports reach the session as user messages too; only what the user sent, from any view, shows as theirs. */
     const drainMessages = (messages: AgentMessage[], info: RunInfo) => {
-      const displayable = messages.filter(message => message.role === 'user' || message.role === 'assistant' || message.role === 'toolResult');
+      // The window's handoff, written once the conversation ended, is for the main agent: the window shows the conversation only.
+      const end = info.handoff ? messages.findIndex(message => message.role === 'user' && textContent(message.content).startsWith(HANDOFF_REQUEST)) : -1;
+      const displayable = (end < 0 ? messages : messages.slice(0, end)).filter(message => message.role === 'user' || message.role === 'assistant' || message.role === 'toolResult');
       // An attachment may replay hours of tool output. Pace the history instead of overflowing the bounded wire
       // or starving the owner's event loop. The next status tick continues from the same cursor, which stays valid because
       // retained messages are only ever appended (unlike Pi's projection, which compaction and retries replace).
@@ -208,11 +211,13 @@ export async function serveWindows(directory: string, children: Children, availa
         return;
       }
       if (live) drainMessages(children.retained(child), info);
-      const preview = live?.streaming && 'content' in live.streaming ? textContent(live.streaming.content).slice(-2000) : '';
-      const text = `${info.state === 'waiting' ? 'Awaiting user or child reports' : info.state} · ${info.model}\n${live ? [...live.tools.values()].map(t => t.name).join(', ') : ''}\n${preview}`;
+      // Once the conversation has ended, what its session still streams is the handoff, which is for the main agent.
+      const working = info.handoff ? undefined : live;
+      const preview = working?.streaming && 'content' in working.streaming ? textContent(working.streaming.content).slice(-2000) : '';
+      const text = `${info.state === 'waiting' ? 'Awaiting user or child reports' : info.state} · ${info.model}\n${working ? [...working.tools.values()].map(t => t.name).join(', ') : ''}\n${preview}`;
       let state: LiveState = { state: info.state, model: info.model,
-        streaming: live?.streaming?.role === 'assistant' ? clip(live.streaming) : undefined,
-        tools: live ? [...live.tools].map(([id, t]) => ({ id, name: t.name, args: t.args, output: clipOutput(t.output), started: t.started })) : [],
+        streaming: working?.streaming?.role === 'assistant' ? clip(working.streaming) : undefined,
+        tools: working ? [...working.tools].map(([id, t]) => ({ id, name: t.name, args: t.args, output: clipOutput(t.output), started: t.started })) : [],
         // A finished child counts until its report has reached this agent, so the agent never looks idle in between.
         agents: [...children.history.records.values()].filter(run => run.parentId === child && (isActiveRun(run) || children.live(run.id))).length,
         queued: info.guidance.flatMap(g => g.state === 'queued' && g.from === 'user' ? [g.text.slice(0, 1000)] : []) };

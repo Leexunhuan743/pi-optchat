@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { createServer, type Socket } from 'node:net';
-import { createAgentSession, DefaultResourceLoader, SettingsManager, CustomMessageComponent, initTheme, ModelRegistry, ModelRuntime, type ExtensionAPI, type TerminalInputHandler, type ExtensionContext, type MessageRenderer, type Theme } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, DefaultResourceLoader, type ToolDefinition, SettingsManager, CustomMessageComponent, initTheme, ModelRegistry, ModelRuntime, type ExtensionAPI, type TerminalInputHandler, type ExtensionContext, type MessageRenderer, type Theme } from '@earendil-works/pi-coding-agent';
 import { Editor, KeybindingsManager, setKeybindings, TUI_KEYBINDINGS, TuiMainScreen, type Component, type Terminal } from '@earendil-works/pi-tui';
 import { createAssistantMessageEventStream, type AssistantMessage } from '@earendil-works/pi-ai';
 import { showAgentView } from '../src/agent-view.ts';
@@ -18,7 +18,9 @@ import { serveWindows, connectWindow, joinHeadless, listAttachableAgents, type W
 import { profileSocket, lockProfile, createProfile, profilePath } from '../src/profiles.ts';
 import { openConnectedWindow, registerConnectedRenderer } from '../src/connected-window.ts';
 import { createHandoffSummarizer } from '../src/handoff.ts';
+import { HANDOFF_REQUEST } from '../src/prompts.ts';
 import { removeDir } from './support.ts';
+import { Type } from 'typebox';
 
 /** These tests cover delegation below the first level, which profiles opt into with Subagent levels. */
 const nested = () => ({ subagentLevels: 3, maxAgents: 8 });
@@ -35,7 +37,13 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
   const memory = new Memory(dir, async input => input.source.slice(0, 100), () => {});
   const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: null,
     modelsStorePath: join(dir, 'models-cache.json'), refreshOnCreate: false });
-  const control = { failSummary: false, truncateSummary: false, holdSummary: false, summaryText: 'Handoff: retained the user correction and actual work.' };
+  const control = { failSummary: false, truncateSummary: false, holdSummary: false, summaryText: 'Handoff: retained the user correction and actual work.',
+    window: 'answer' as 'answer' | 'error' | 'empty' | 'tool call, then handoff' | 'stuck tool', releaseTool: () => {} };
+  // A tool that ignores the abort: it returns only once the test releases it.
+  const stuck: ToolDefinition = { name: 'stuck', label: 'Stuck', description: 'Never cancels.', parameters: Type.Object({}),
+    execute: () => new Promise(resolve => { control.releaseTool = () => resolve({ content: [{ type: 'text', text: 'released' }], details: {} }); }) };
+  /** Every request's messages as the provider got them, in order; `handoff` marks the window's handoff request. */
+  const contexts: { messages: string[]; handoff: boolean }[] = [];
   const requests: string[] = [], summaries: string[] = [], reports: string[] = [], warnings: string[] = [];
   const summaryOptions: { maxTokens?: number; systemPrompt?: string }[] = [];
   runtime.registerProvider('window-test', {
@@ -45,8 +53,9 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
       const stream = createAssistantMessageEventStream();
       const last = context.messages.at(-1);
       const text = textContent(last && 'content' in last ? last.content : '');
-      const summary = text.includes('Prior handoff:');
-      if (summary) summaries.push(text); else requests.push(text);
+      const summary = text.includes('Prior handoff:'), handoff = context.messages.some(m => m.role === 'user' && textContent(m.content).startsWith(HANDOFF_REQUEST));
+      contexts.push({ messages: context.messages.map(m => JSON.stringify(m)), handoff });
+      if (summary) summaries.push(text); else if (!handoff) requests.push(text);
       if (summary) summaryOptions.push({ maxTokens: options?.maxTokens, systemPrompt: textContent(context.messages.find(m => m.role === 'system')?.content) });
       const message: AssistantMessage = { role: 'assistant', content: [{ type: 'text', text: summary ? control.summaryText : `Reply: ${text.split('Your task:\n').at(-1)}` }],
         api: model.api, model: model.id, provider: model.provider, stopReason: 'stop', timestamp: Date.now(), usage: emptyUsage() };
@@ -60,6 +69,14 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
         message.content = [{ type: 'toolCall', id: 'evidence', name: 'bash', arguments: { command: "printf 'DESCENDANT_TESTS_PASSED_123\\n'" } }];
       }
       if (summary && control.failSummary) { message.stopReason = 'error'; message.errorMessage = 'Synthetic summarizer unavailable'; }
+      if (handoff) {
+        const checks = control.window === 'tool call, then handoff' && last?.role === 'user';
+        message.content = control.window === 'stuck tool' && last?.role === 'user' ? [{ type: 'toolCall', id: 'stuck', name: 'stuck', arguments: {} }]
+          : checks ? [{ type: 'text', text: 'Let me check one thing first.' }, { type: 'toolCall', id: 'check', name: 'bash', arguments: { command: "printf 'CHECKED_BEFORE_HANDOFF'" } }]
+          : [{ type: 'text', text: control.window === 'empty' ? '' : 'Window handoff: kept the existing API.' }];
+        if (message.content.some(block => block.type === 'toolCall')) message.stopReason = 'toolUse';
+        if (control.window === 'error') { message.stopReason = 'error'; message.errorMessage = 'Synthetic window error'; }
+      }
       if (text === 'spawn one') {
         message.content = [{ type: 'toolCall', id: 'spawn-one', name: 'spawn', arguments: { tasks: [{ task: 'hold work descendant' }] } }];
         message.stopReason = 'toolUse';
@@ -75,7 +92,7 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
       }
       void (async () => {
         stream.push({ type: 'start', partial: message });
-        const hold = summary ? control.holdSummary : text.includes('hold work') || last?.role === 'toolResult' && text.includes('DESCENDANT_TESTS_PASSED_123');
+        const hold = summary || handoff ? control.holdSummary : text.includes('hold work') || last?.role === 'toolResult' && text.includes('DESCENDANT_TESTS_PASSED_123');
         // A held reply is mid-stream, as a real one would be while the model is still writing.
         if (hold) stream.push({ type: 'text_delta', contentIndex: 0, delta: 'Reply', partial: message });
         // Outlasts a few window status ticks, so its parent is seen waiting on it.
@@ -94,15 +111,18 @@ async function fixture(contextWindow = 1_000_000, maxTokens = 64_000) {
   const registry = new ModelRegistry(runtime), choice = () => ({ provider: 'window-test', model: 'child', thinking: 'off' as const });
   const ledger = new UsageLedger(dir);
   const summarize = createHandoffSummarizer(registry, choice, reply => ledger.compression(reply, 'compactor', 'owner'));
-  const options = { settings: nested, parentSession: 'owner', usage: ledger, createSession: (options: Parameters<typeof createAgentSession>[0]) => createAgentSession({ ...options, modelRuntime: runtime }), summarizeHandoff: summarize };
+  const options = { settings: nested, parentSession: 'owner', usage: ledger, summarizeHandoff: summarize, windowHandoffTimeout: undefined as number | undefined,
+    createSession: (options: Parameters<typeof createAgentSession>[0]) => createAgentSession({ ...options, modelRuntime: runtime, customTools: [...options?.customTools ?? [], stuck] }) };
   const children = new Children(memory, registry, choice, () => '', async text => { reports.push(text); }, text => warnings.push(text), dir, options);
   const unlock = await lockProfile(dir, 'test owner');
-  return { control, dir, memory, children, requests, summaries, summaryOptions, reports, warnings, registry, runtime, choice, options, ledger,
+  return { control, contexts, dir, memory, children, requests, summaries, summaryOptions, reports, warnings, registry, runtime, choice, options, ledger,
     async close() { await children.close(); await memory.close(); await unlock(); removeDir(dir); } };
 }
 
 test('connected window keeps one real SDK conversation, communicates both ways, and completes its subtree with one handoff', async () => {
   const f = await fixture();
+  // The compactor's handoff: the window fails to write its own.
+  f.control.window = 'error';
   const events: WindowEvent[] = [];
   const close = await serveWindows(f.dir, f.children, () => true, async text => { f.reports.push(text); });
   const client = await connectWindow(f.dir, event => events.push(event), () => {});
@@ -142,7 +162,7 @@ test('connected window keeps one real SDK conversation, communicates both ways, 
     await assert.rejects(client.request('say', 'Too late'), /closing/);
     await f.children.recoverHandoffs();
     assert.equal(f.summaries.length, 1, 'delivered handoffs must not be repeated');
-    assert.deepEqual(f.warnings, []);
+    assert.match(f.warnings.join("\n"), /could not write its own handoff, so the compactor writes it: Synthetic window error/);
   } finally { client.close(); await close(); await f.close(); }
 });
 
@@ -358,12 +378,12 @@ test('pending handoffs survive failed delivery and restart without another model
     run.state = 'waiting'; run.handoff = undefined; f.children.history.save(run);
     const failing = new Children(f.memory, f.registry, f.choice, () => '', async () => { throw new Error('delivery unavailable'); }, () => {}, f.dir, f.options);
     await assert.rejects(failing.recoverHandoffs(), /delivery unavailable/);
-    const calls = f.summaries.length;
+    const calls = f.contexts.length;
     const recovered: string[] = [];
     const restored = new Children(f.memory, f.registry, f.choice, () => '', async text => { recovered.push(text); }, () => {}, f.dir, f.options);
     await restored.recoverHandoffs(); await restored.recoverHandoffs();
     assert.equal(recovered.length, 1); assert.match(recovered[0], /owner-stopped/);
-    assert.equal(f.summaries.length, calls);
+    assert.equal(f.contexts.length, calls);
     await failing.close(); await restored.close();
   } finally { await f.close(); }
 });
@@ -380,14 +400,14 @@ test('closing the owner leaves a connected handoff for the next start instead of
     await until(() => f.children.history.records.get(id)?.state === 'waiting');
     // What /reload does: the window ends as owner-stopped, without a summary.
     f.children.deferHandoffs(); await close();
-    assert.equal(f.summaries.length, 0);
+    assert.ok(!f.contexts.some(c => c.handoff));
     assert.deepEqual(f.children.history.records.get(id)?.handoff, { reason: 'owner-stopped' });
 
     // The next start's recovery is aborted by another quick /reload, still leaving the handoff undelivered.
     f.control.holdSummary = true;
     const interrupted = restart();
     const recovery = interrupted.recoverHandoffs();
-    await until(() => f.summaries.length === 1);
+    await until(() => f.contexts.some(c => c.handoff));
     interrupted.deferHandoffs(); await recovery; await interrupted.close();
     assert.deepEqual(interrupted.history.records.get(id)?.handoff, { reason: 'owner-stopped' }, 'no fallback written, nothing delivered');
 
@@ -396,7 +416,8 @@ test('closing the owner leaves a connected handoff for the next start instead of
     const restored = restart(delivered);
     await restored.recoverHandoffs(); await restored.recoverHandoffs();
     assert.equal(delivered.length, 1);
-    assert.match(delivered[0], /interrupted \(owner-stopped\)\.[^]*Handoff: retained the user correction/);
+    assert.match(delivered[0], /interrupted \(owner-stopped\)\.[^]*Window handoff: kept the existing API/);
+    assert.equal(f.summaries.length, 0);
     await restored.close();
   } finally { client.close(); await f.close(); }
 });
@@ -421,6 +442,8 @@ test('disconnect during startup cancels cleanly, and importing owners reject new
 
 test('long handoffs fold all transcript chunks, and a failed summarizer still reports an honest fallback', async () => {
   const f = await fixture();
+  // The compactor's handoff: the window fails to write its own.
+  f.control.window = 'error';
   try {
     const [id] = await f.children.spawn([{ task: 'Initial task' }], f.dir, undefined, undefined, true);
     await until(() => f.children.history.records.get(id)?.state === 'waiting');
@@ -455,6 +478,8 @@ test('long handoffs fold all transcript chunks, and a failed summarizer still re
 
 test('a transcript below the handoff budget is summarized in one call with a larger output allowance', async () => {
   const f = await fixture();
+  // The compactor's handoff: the window fails to write its own.
+  f.control.window = 'error';
   try {
     const [id] = await f.children.spawn([{ task: 'Initial task' }], f.dir, undefined, undefined, true);
     await until(() => f.children.history.records.get(id)?.state === 'waiting');
@@ -471,6 +496,8 @@ test('a transcript below the handoff budget is summarized in one call with a lar
 
 test('handoffs respect smaller model windows and output limits while retaining all evidence', async () => {
   const f = await fixture(32_000, 2048);
+  // The compactor's handoff: the window fails to write its own.
+  f.control.window = 'error';
   try {
     const [id] = await f.children.spawn([{ task: 'Initial task' }], f.dir, undefined, undefined, true);
     await until(() => f.children.history.records.get(id)?.state === 'waiting');
@@ -491,6 +518,8 @@ test('handoffs respect smaller model windows and output limits while retaining a
 
 test('a handoff truncated by the output limit reports a fallback instead of claiming to be complete', async () => {
   const f = await fixture();
+  // The compactor's handoff: the window fails to write its own.
+  f.control.window = 'error';
   try {
     const [id] = await f.children.spawn([{ task: 'Initial task' }], f.dir, undefined, undefined, true);
     await until(() => f.children.history.records.get(id)?.state === 'waiting');
@@ -504,6 +533,8 @@ test('a handoff truncated by the output limit reports a fallback instead of clai
 
 test('recovery leaves newly started conversations to their own completion path', async () => {
   const f = await fixture();
+  // The compactor's handoff: the window fails to write its own.
+  f.control.window = 'error';
   let releaseOld = () => {}, releaseNew = () => {};
   const oldGate = new Promise<void>(resolve => { releaseOld = resolve; });
   const newGate = new Promise<void>(resolve => { releaseNew = resolve; });
@@ -538,6 +569,8 @@ test('recovery leaves newly started conversations to their own completion path',
 
 test('handoffs include stopped descendant evidence at every depth, including after restart', async () => {
   const f = await fixture();
+  // The compactor's handoff: the window fails to write its own.
+  f.control.window = 'error';
   try {
     const [parent] = await f.children.spawn([{ task: 'hold work parent' }], f.dir, undefined, undefined, true);
     await until(() => f.requests.some(text => text.includes('hold work parent')));
@@ -1038,4 +1071,188 @@ test("Pi's compaction replaces session.messages, yet a connected window still ge
     await until(() => replies().length === 4);
     assert.equal(replies().at(-1), 'Reply: after compaction');
   } finally { client.close(); await close(); await f.close(); }
+});
+
+/** The window's handoff request must repeat its last request byte for byte, with only its reply and the handoff prompt after it, so the provider reads it all from the cache. */
+function assertCachedPrefix(contexts: { messages: string[]; handoff: boolean }[]) {
+  const handoff = contexts.findLast(c => c.handoff), before = contexts.slice(0, contexts.lastIndexOf(handoff!)).findLast(c => !c.handoff);
+  assert.ok(handoff && before);
+  assert.deepEqual(handoff.messages.slice(0, before.messages.length), before.messages);
+  assert.equal(handoff.messages.length, before.messages.length + 2);
+  assert.match(handoff.messages.at(-2)!, /"role":"assistant"/);
+}
+
+test('an ended window writes its own handoff from its cached context, and the compactor is not called', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    await f.children.finish(id, 'complete');
+    const text = f.children.history.records.get(id)?.handoff?.text ?? '';
+    assert.match(text, /completed by user\..*\nWindow handoff: kept the existing API\.\n/);
+    assert.match(f.contexts.at(-1)!.messages.at(-1)!, /ended: the user completed it/);
+    assertCachedPrefix(f.contexts);
+    assert.equal(f.summaries.length, 0);
+    // The handoff is a turn in the window's own transcript, so its usage is counted with the window's.
+    assert.equal(f.ledger.entries.filter(e => e.runId === id).length, f.children.messages(id).filter(m => m.role === 'assistant').length);
+    assert.ok(!f.ledger.entries.some(e => e.role === 'compactor'));
+    assert.deepEqual(f.warnings, []);
+  } finally { await f.close(); }
+});
+
+for (const failure of ['error', 'empty'] as const) {
+  test(`a window that can't write its handoff (${failure}) falls back to the compactor`, async () => {
+    const f = await fixture();
+    f.control.window = failure;
+    try {
+      const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+      await until(() => f.children.history.records.get(id)?.state === 'waiting');
+      await f.children.finish(id, 'complete');
+      assert.ok(f.contexts.some(c => c.handoff));
+      assert.equal(f.summaries.length, 1);
+      assert.match(f.children.history.records.get(id)?.handoff?.text ?? '', /Handoff: retained the user correction/);
+      assert.match(f.warnings.join('\n'), new RegExp(`${id} could not write its own handoff, so the compactor writes it`));
+    } finally { await f.close(); }
+  });
+}
+
+test('a window may check a fact with a tool before its handoff, and only its final reply is the handoff', async () => {
+  const f = await fixture();
+  f.control.window = 'tool call, then handoff';
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    await f.children.finish(id, 'complete');
+    const text = f.children.history.records.get(id)?.handoff?.text ?? '';
+    assert.match(text, /Window handoff: kept the existing API/);
+    assert.doesNotMatch(text, /Let me check/);
+    assert.match(f.contexts.at(-1)!.messages.at(-1)!, /"role":"toolResult".*CHECKED_BEFORE_HANDOFF/);
+    assert.equal(f.summaries.length, 0);
+  } finally { await f.close(); }
+});
+
+test('a window whose subagent was stopped by its ending still writes its handoff, told which subagents were stopped', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'hold work parent' }], f.dir, undefined, undefined, true);
+    await until(() => f.requests.some(text => text.includes('hold work parent')));
+    const [child] = await f.children.spawn([{ task: 'hold work descendant' }], f.dir, undefined, id);
+    await until(() => f.requests.some(text => text.includes('hold work descendant')));
+    await f.children.finish(id, 'complete');
+    assert.equal(f.children.history.records.get(child)?.state, 'stopped');
+    assert.ok(f.contexts.at(-1)!.messages.at(-1)!.includes(`Stopped subagents: \`${child}\` (full transcripts available via zoom)`));
+    assert.equal(f.summaries.length, 0);
+    assert.match(f.children.history.records.get(id)?.handoff?.text ?? '', /Window handoff: kept the existing API/);
+  } finally { await f.close(); }
+});
+
+test('a report a paused window never read goes into its handoff request', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'hold work parent' }], f.dir, undefined, undefined, true);
+    await until(() => f.requests.some(text => text.includes('hold work parent')));
+    const [child] = await f.children.spawn([{ task: 'slow descendant' }], f.dir, undefined, id);
+    assert.equal(await f.children.interrupt(id), 'paused');
+    await until(() => f.children.history.records.get(child)?.state === 'completed');
+    await f.children.finish(id, 'complete');
+    assert.match(f.contexts.at(-1)!.messages.at(-1)!, new RegExp(`Reports from your subagents that you never read:.*\\[${child}\\]`));
+    assert.equal(f.summaries.length, 0);
+  } finally { await f.close(); }
+});
+
+test('guidance still queued in Pi when a busy window completes is listed in its handoff request, not taken as new input', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'hold work parent' }], f.dir, undefined, undefined, true);
+    await until(() => f.requests.some(text => text.includes('hold work parent')));
+    await f.children.tell(id, 'STALE_GUIDANCE', 'user');
+    await f.children.finish(id, 'complete');
+    const handoffs = f.contexts.filter(c => c.handoff);
+    assert.equal(handoffs.length, 1, 'one handoff request, with no turn after it');
+    assert.match(handoffs[0].messages.at(-1)!, /never got:.*STALE_GUIDANCE/);
+    assert.ok(!handoffs[0].messages.slice(0, -1).some(m => m.includes('STALE_GUIDANCE')));
+    assert.match(f.children.history.records.get(id)?.handoff?.text ?? '', /Window handoff: kept the existing API/);
+  } finally { await f.close(); }
+});
+
+test('closing while a window writes its handoff does not wait for it, and the next start writes it', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    f.control.holdSummary = true;
+    const finishing = f.children.finish(id, 'complete');
+    await until(() => f.contexts.some(c => c.handoff));
+    f.children.deferHandoffs(); await f.children.close(); await finishing;
+    assert.deepEqual(f.children.history.records.get(id)?.handoff, { reason: 'complete' });
+    f.control.holdSummary = false;
+    const delivered: string[] = [];
+    const restored = new Children(f.memory, f.registry, f.choice, () => '', async text => { delivered.push(text); }, () => {}, f.dir, f.options);
+    try {
+      await restored.recoverHandoffs();
+      assert.equal(delivered.length, 1);
+      assert.match(delivered[0], /completed by user\..*\nWindow handoff: kept the existing API\.\n/);
+      assert.equal(f.summaries.length, 0);
+    } finally { await restored.close(); }
+  } finally { await f.close(); }
+});
+
+test('a handoff tool that ignores the abort holds up neither closing nor the timeout fallback', async () => {
+  for (const ending of ['close', 'timeout'] as const) {
+    const f = await fixture();
+    f.control.window = 'stuck tool';
+    if (ending === 'timeout') f.options.windowHandoffTimeout = 100;
+    try {
+      const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+      await until(() => f.children.history.records.get(id)?.state === 'waiting');
+      const finishing = f.children.finish(id, 'complete');
+      await until(() => f.contexts.some(c => c.handoff));
+      if (ending === 'close') {
+        f.children.deferHandoffs(); await f.children.close(); await finishing;
+        assert.deepEqual(f.children.history.records.get(id)?.handoff, { reason: 'complete' }, 'left for the next start');
+      } else {
+        await finishing;
+        assert.match(f.warnings.join('\n'), /could not write its own handoff, so the compactor writes it/);
+        assert.match(f.children.history.records.get(id)?.handoff?.text ?? '', /Handoff: retained the user correction/);
+      }
+    } finally { f.control.releaseTool(); await f.close(); }
+  }
+});
+
+test('a batch flushed by a stopped child still hands its finished sibling\'s report to the stopping window', async () => {
+  const f = await fixture();
+  f.options.settings = () => ({ ...nested(), groupReports: true });
+  try {
+    const [id] = await f.children.spawn([{ task: 'hold work parent' }], f.dir, undefined, undefined, true);
+    await until(() => f.requests.some(text => text.includes('hold work parent')));
+    const [done, held] = await f.children.spawn([{ task: 'Investigate this repository.' }, { task: 'hold work descendant' }], f.dir, undefined, id);
+    await until(() => f.children.history.records.get(done)?.state === 'completed');
+    await f.children.finish(id, 'complete');
+    assert.equal(f.children.history.records.get(held)?.state, 'stopped');
+    const request = f.contexts.findLast(c => c.handoff)!.messages.at(-1)!;
+    assert.match(request, new RegExp(`never read:.*\\[${done}\\]`));
+    assert.match(request, new RegExp(`Stopped subagents: \`${held}\``));
+    assert.ok(!request.includes(`[${held}]`), 'the stopped child is named, not reported');
+  } finally { await f.close(); }
+});
+
+test('a handoff deferred by /reload is written by the reopened window on the next start', async () => {
+  const f = await fixture();
+  try {
+    const [id] = await f.children.spawn([{ task: 'Investigate this repository.' }], f.dir, undefined, undefined, true);
+    await until(() => f.children.history.records.get(id)?.state === 'waiting');
+    f.children.deferHandoffs(); await f.children.close();
+    assert.deepEqual(f.children.history.records.get(id)?.handoff, { reason: 'owner-stopped' });
+    assert.ok(!f.contexts.some(c => c.handoff), 'closing does not ask the window');
+    const delivered: string[] = [];
+    const restored = new Children(f.memory, f.registry, f.choice, () => '', async text => { delivered.push(text); }, () => {}, f.dir, f.options);
+    try {
+      await restored.recoverHandoffs();
+      assert.equal(delivered.length, 1);
+      assert.match(delivered[0], /interrupted \(owner-stopped\)\..*\nWindow handoff: kept the existing API\.\n/);
+      assert.match(f.contexts.at(-1)!.messages.at(-1)!, /ended: the main Pi window closed or reloaded/);
+      assertCachedPrefix(f.contexts);
+      assert.equal(f.summaries.length, 0);
+    } finally { await restored.close(); }
+  } finally { await f.close(); }
 });

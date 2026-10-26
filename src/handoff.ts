@@ -3,7 +3,7 @@ import type { AgentMessage } from '@earendil-works/pi-agent-core';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import { reasoningFor, retryTransient, type ModelChoice } from './compactor.ts';
 import { HANDOFF } from './prompts.ts';
-import type { RunInfo } from './runs.ts';
+import { undelivered, type RunInfo } from './runs.ts';
 import { textContent } from './transcript.ts';
 
 export interface HandoffEvidence { run: RunInfo; messages: AgentMessage[]; transcriptError?: string }
@@ -24,8 +24,8 @@ function formatEvidence({ run, messages, transcriptError }: HandoffEvidence) {
     if (message.role === 'toolResult') return [`TOOL RESULT (${message.toolName}, error=${message.isError}): ${textContent(message.content)}`];
     return [];
   }).join('\n\n') + `\n\nRecorded outcome before handoff: ${run.report ?? 'No final answer'}`;
-  const undelivered = run.guidance.filter(g => g.state === 'undelivered');
-  return transcript + (undelivered.length ? `\nMessages queued but NOT delivered to this agent:\n${undelivered.map(g => g.text).join('\n')}` : '');
+  const queued = undelivered(run);
+  return transcript + (queued.length ? `\nMessages queued but NOT delivered to this agent:\n${queued.join('\n')}` : '');
 }
 
 /** Summarize in one call when possible; otherwise fold chunks with the prior handoff included in the budget. */
@@ -54,13 +54,24 @@ export function createHandoffSummarizer(registry: ModelRegistry, choice: () => M
         systemPrompt: HANDOFF,
         messages: [{ role: 'user', timestamp: Date.now(), content: prefix + transcript.subarray(offset, end).toString('utf8') }],
       }, { reasoning: reasoningFor(model, selected.thinking), maxTokens, signal: AbortSignal.any([AbortSignal.timeout(300_000), ...signal ? [signal] : []]) }).result(), usage, retryDelays, signal);
-      if (reply.stopReason === 'error' || reply.stopReason === 'aborted') throw new Error(reply.errorMessage ?? reply.stopReason);
-      if (reply.stopReason === 'length') throw new Error('Handoff hit the model output limit before finishing');
-      summary = textContent(reply.content).trim();
-      if (!summary) throw new Error('Empty handoff summary');
+      summary = handoffText(reply);
       offset = end;
     }
-    const undelivered = run.guidance.filter(g => g.state === 'undelivered');
-    return summary + (undelivered.length ? `\nMessages queued but NOT delivered to the agent:\n${undelivered.map(g => g.text).join('\n')}` : '');
+    return withUndelivered(run, summary);
   };
 }
+
+/** A handoff reply's text; a failed, cut-off, empty or tool-calling reply throws. */
+export function handoffText(reply: AssistantMessage) {
+  if (reply.stopReason === 'error' || reply.stopReason === 'aborted') throw new Error(reply.errorMessage ?? reply.stopReason);
+  if (reply.stopReason === 'length') throw new Error('Handoff hit the model output limit before finishing');
+  // A reply that calls a tool isn't finished: its text is a preamble, not the handoff.
+  if (reply.content.some(block => block.type === 'toolCall')) throw new Error('The handoff reply ended on a tool call');
+  const text = textContent(reply.content).trim();
+  if (!text) throw new Error('Empty handoff summary');
+  return text;
+}
+export const withUndelivered = (run: RunInfo, summary: string) => {
+  const queued = undelivered(run);
+  return summary + (queued.length ? `\nMessages queued but NOT delivered to the agent:\n${queued.join('\n')}` : '');
+};
