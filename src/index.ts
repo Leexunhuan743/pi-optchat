@@ -31,7 +31,7 @@ import { joinHeadless, listAttachableAgents, serveWindows } from './window-bridg
 import { openConnectedWindow, registerConnectedRenderer } from './connected-window.ts';
 import { createHandoffSummarizer } from './handoff.ts';
 import { mainTitle, TabTitle } from './title.ts';
-import { showModelPicker, showSettings } from './settings-page.ts';
+import { showModel, showModelPicker, showSettings } from './settings-page.ts';
 import { showMenu } from './menu.ts';
 
 const binding = 'optchat.profile';
@@ -668,9 +668,9 @@ export default function optchat(pi: ExtensionAPI) {
       return;
     }
     if (action === 'template save') {
-      const a = required();
-      atomicWrite(join(templatePath(), 'config.json'), readFileSync(join(a.dir, 'config.json'), 'utf8'));
-      ctx.ui.notify(`New profiles start from ${a.config.compactor.provider}/${a.config.compactor.model} (compactor) and ${a.config.subagent.provider}/${a.config.subagent.model} (subagent), with this profile's settings. Template: ${templatePath()}/config.json`, 'info');
+      const a = required(), file = join(templatePath(), 'config.json');
+      atomicWrite(file, readFileSync(join(a.dir, 'config.json'), 'utf8'));
+      ctx.ui.notify(`New profiles start from this profile's config: compactor ${showModel(a.config.compactor)}, subagent ${showModel(a.config.subagent)}, and its settings. Saved ${file}`, 'info');
       return;
     }
     if (action === 'browse') {

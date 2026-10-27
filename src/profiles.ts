@@ -44,6 +44,10 @@ export function readTemplate(): ProfileConfig {
 function templateInstructions() {
   try { return readFileSync(join(templatePath(), 'AGENTS.md'), 'utf8'); } catch { return undefined; }
 }
+/** What a new profile starts from: the template's config, or the built-in defaults when there is none or it is invalid. Pages that say "default" compare against this. */
+export function baselineConfig(): ProfileConfig {
+  try { return existsSync(join(templatePath(), 'config.json')) ? readTemplate() : defaults; } catch { return defaults; }
+}
 export function createProfile(name: string) {
   const dir = profilePath(name);
   if (existsSync(dir)) throw new Error(`Profile already exists: ${name}`);
